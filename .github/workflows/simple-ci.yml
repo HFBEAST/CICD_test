@@ -6,16 +6,44 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # 第一阶段：验证测试
+  validation:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.12'
+
     - name: Install dependencies
       run: |
         pip install -r requirements-dev.txt
-    - name: Run tests
-      run: pytest
+
+    - name: Run validation tests
+      run: |
+        echo "🔍 运行验证测试..."
+        pytest tests/test_validation.py -v --tb=short
+      continue-on-error: false  # 如果失败，停止后续步骤
+
+  # 第二阶段：完整测试
+  full-test:
+    needs: validation  # 依赖validation任务成功
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements-dev.txt
+
+    - name: Run all tests
+      run: |
+        echo "✅ 运行完整测试套件..."
+        pytest tests/ -v
