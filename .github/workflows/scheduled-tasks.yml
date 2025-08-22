@@ -1,0 +1,109 @@
+name: Scheduled Tasks
+
+on:
+  schedule:
+    # 每天凌晨2点运行（UTC时间）
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  dependency-update:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 设置Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: 检查依赖更新
+      run: |
+        pip install pip-review
+        pip-review --local --auto > dependency-updates.txt
+
+    - name: 创建依赖更新PR
+      uses: peter-evans/create-pull-request@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        commit-message: 'chore: update dependencies'
+        title: '[Automated] Dependency Updates'
+        body: |
+          ## Automated Dependency Updates
+          
+          This PR contains dependency updates found by the scheduled job.
+          
+          Please review the changes carefully before merging.
+        branch: automated-dependency-updates
+        delete-branch: true
+
+  security-audit:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 运行安全审计
+      run: |
+        pip install safety bandit
+        
+        echo "## Security Audit Report" > security-report.md
+        echo "Date: $(date)" >> security-report.md
+        echo "" >> security-report.md
+        
+        echo "### Dependency Vulnerabilities" >> security-report.md
+        safety check --json | python -m json.tool >> security-report.md
+        
+        echo "### Code Security Issues" >> security-report.md
+        bandit -r src/ -f json | python -m json.tool >> security-report.md
+
+    - name: 上传安全报告
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-audit-report
+        path: security-report.md
+
+    - name: 发送安全告警
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: custom
+        custom_payload: |
+          {
+            "text": "🔒 Security Audit Alert",
+            "attachments": [{
+              "color": "danger",
+              "text": "Security vulnerabilities detected in scheduled audit. Please review the report."
+            }]
+          }
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 清理旧的Docker镜像
+      run: |
+        # 清理30天前的镜像
+        aws ecr list-images --repository-name my-python-api \
+          --filter tagStatus=TAGGED \
+          --query 'imageIds[?imageTag != `latest` && imageTag != `staging-latest`]' \
+          --output json | \
+        jq '.[] | select(.imagePushedAt < (now - 30*24*60*60))' | \
+        jq -s '.' | \
+        aws ecr batch-delete-image --repository-name my-python-api --image-ids file:///dev/stdin
+
+    - name: 清理旧的部署记录
+      run: |
+        # 保留最近30天的记录
+        cutoff_date=$(date -d '30 days ago' +%Y%m%d)
+        aws s3 ls s3://my-deployments/production/ | \
+        while read -r line; do
+          file_date=$(echo $line | awk '{print $4}' | cut -d'-' -f1)
+          if [[ $file_date < $cutoff_date ]]; then
+            aws s3 rm s3://my-deployments/production/$(echo $line | awk '{print $4}')
+          fi
+        done

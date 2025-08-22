@@ -1,0 +1,250 @@
+name: Deploy to Production
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy (e.g., v1.2.3)'
+        required: true
+        type: string
+
+jobs:
+  # 部署前检查
+  pre-deployment-checks:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 验证版本标签
+      id: check
+      run: |
+        if [[ "${{ github.event_name }}" == "release" ]]; then
+          VERSION="${{ github.event.release.tag_name }}"
+        else
+          VERSION="${{ github.event.inputs.version }}"
+        fi
+        
+        # 验证版本格式
+        if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "Invalid version format: $VERSION"
+          echo "proceed=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        echo "Version to deploy: $VERSION"
+        echo "proceed=true" >> $GITHUB_OUTPUT
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: 检查测试环境状态
+      run: |
+        response=$(curl -s -o /dev/null -w "%{http_code}" https://staging-api.example.com/health)
+        if [ $response -ne 200 ]; then
+          echo "Staging environment is not healthy. Aborting production deployment."
+          exit 1
+        fi
+
+  # 蓝绿部署
+  blue-green-deployment:
+    needs: pre-deployment-checks
+    if: needs.pre-deployment-checks.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.example.com
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ needs.pre-deployment-checks.outputs.version }}
+
+    - name: 配置AWS凭证
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: 登录Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-get-login@v2
+
+    - name: 构建生产镜像
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: my-python-api
+        IMAGE_TAG: ${{ needs.pre-deployment-checks.outputs.version }}
+      run: |
+        docker build \
+          --build-arg VERSION=$IMAGE_TAG \
+          --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+          --build-arg VCS_REF=${{ github.sha }} \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+          .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+    - name: 部署到蓝环境
+      run: |
+        # 更新蓝环境的任务定义
+        aws ecs register-task-definition \
+          --family my-api-blue \
+          --container-definitions "[{
+            \"name\": \"my-api\",
+            \"image\": \"$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG\",
+            \"memory\": 512,
+            \"cpu\": 256,
+            \"essential\": true,
+            \"portMappings\": [{
+              \"containerPort\": 5000,
+              \"protocol\": \"tcp\"
+            }],
+            \"environment\": [
+              {\"name\": \"ENV\", \"value\": \"production\"},
+              {\"name\": \"VERSION\", \"value\": \"$IMAGE_TAG\"}
+            ]
+          }]"
+        
+        # 更新蓝环境服务
+        aws ecs update-service \
+          --cluster production-cluster \
+          --service my-api-blue \
+          --task-definition my-api-blue \
+          --desired-count 4
+        
+        # 等待蓝环境稳定
+        aws ecs wait services-stable \
+          --cluster production-cluster \
+          --services my-api-blue
+
+    - name: 运行生产环境测试
+      run: |
+        # 对蓝环境运行测试
+        BLUE_URL="https://blue-api.example.com"
+        
+        # 健康检查
+        for i in {1..10}; do
+          response=$(curl -s -o /dev/null -w "%{http_code}" $BLUE_URL/health)
+          if [ $response -eq 200 ]; then
+            echo "Health check passed"
+            break
+          fi
+          sleep 10
+        done
+        
+        # 运行API测试
+        npm install -g newman
+        newman run tests/postman/production-tests.json \
+          --environment-var "base_url=$BLUE_URL"
+
+    - name: 切换流量到蓝环境
+      run: |
+        # 更新ALB目标组权重
+        aws elbv2 modify-rule \
+          --rule-arn ${{ secrets.PROD_ALB_RULE_ARN }} \
+          --actions Type=forward,TargetGroupArn=${{ secrets.BLUE_TARGET_GROUP_ARN }}
+        
+        echo "Traffic switched to blue environment"
+        sleep 30
+
+    - name: 验证生产环境
+      run: |
+        PROD_URL="https://api.example.com"
+        
+        # 验证版本
+        version=$(curl -s $PROD_URL/ | jq -r '.version')
+        if [ "$version" != "${{ needs.pre-deployment-checks.outputs.version }}" ]; then
+          echo "Version mismatch. Expected: ${{ needs.pre-deployment-checks.outputs.version }}, Got: $version"
+          exit 1
+        fi
+        
+        echo "Production deployment verified successfully"
+
+    - name: 更新绿环境（备用）
+      run: |
+        # 现在更新绿环境作为下次部署的备用
+        aws ecs update-service \
+          --cluster production-cluster \
+          --service my-api-green \
+          --task-definition my-api-blue \
+          --desired-count 4
+
+  # 部署后任务
+  post-deployment:
+    needs: blue-green-deployment
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+    - name: 创建部署记录
+      run: |
+        cat << EOF > deployment-record.json
+        {
+          "version": "${{ needs.pre-deployment-checks.outputs.version }}",
+          "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+          "deployer": "${{ github.actor }}",
+          "commit": "${{ github.sha }}",
+          "status": "${{ needs.blue-green-deployment.result }}"
+        }
+        EOF
+        
+        # 上传到S3
+        aws s3 cp deployment-record.json \
+          s3://my-deployments/production/$(date +%Y%m%d-%H%M%S).json
+
+    - name: 发送部署通知
+      uses: 8398a7/action-slack@v3
+      with:
+        status: custom
+        custom_payload: |
+          {
+            "text": "Production Deployment Complete",
+            "attachments": [{
+              "color": "${{ needs.blue-green-deployment.result == 'success' && 'good' || 'danger' }}",
+              "fields": [
+                {
+                  "title": "Version",
+                  "value": "${{ needs.pre-deployment-checks.outputs.version }}",
+                  "short": true
+                },
+                {
+                  "title": "Status",
+                  "value": "${{ needs.blue-green-deployment.result }}",
+                  "short": true
+                },
+                {
+                  "title": "Deployed by",
+                  "value": "${{ github.actor }}",
+                  "short": true
+                },
+                {
+                  "title": "Environment",
+                  "value": "Production",
+                  "short": true
+                }
+              ]
+            }]
+          }
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+    - name: 触发监控告警设置
+      if: needs.blue-green-deployment.result == 'success'
+      run: |
+        # 设置CloudWatch告警
+        aws cloudwatch put-metric-alarm \
+          --alarm-name "API-HighErrorRate-${{ needs.pre-deployment-checks.outputs.version }}" \
+          --alarm-description "High error rate after deployment" \
+          --metric-name 4XXError \
+          --namespace AWS/ApplicationELB \
+          --statistic Sum \
+          --period 300 \
+          --threshold 100 \
+          --comparison-operator GreaterThanThreshold \
+          --evaluation-periods 2

@@ -1,0 +1,117 @@
+name: Performance Testing
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'requirements.txt'
+  workflow_dispatch:
+
+jobs:
+  load-testing:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 启动应用容器
+      run: |
+        docker build -t my-api:test .
+        docker run -d -p 5000:5000 --name test-api my-api:test
+        
+        # 等待应用启动
+        for i in {1..30}; do
+          if curl -f http://localhost:5000/health; then
+            break
+          fi
+          sleep 1
+        done
+
+    - name: 安装K6
+      run: |
+        sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+
+    - name: 运行负载测试
+      run: |
+        cat << 'EOF' > load-test.js
+        import http from 'k6/http';
+        import { check, sleep } from 'k6';
+        import { Rate } from 'k6/metrics';
+        
+        const errorRate = new Rate('errors');
+        
+        export const options = {
+          stages: [
+            { duration: '30s', target: 10 },  // 逐渐增加到10个用户
+            { duration: '1m', target: 10 },   // 保持10个用户
+            { duration: '30s', target: 50 },  // 增加到50个用户
+            { duration: '2m', target: 50 },   // 保持50个用户
+            { duration: '30s', target: 0 },   // 逐渐降到0
+          ],
+          thresholds: {
+            http_req_duration: ['p(95)<500'], // 95%的请求应在500ms内完成
+            errors: ['rate<0.1'],              // 错误率应低于10%
+          },
+        };
+        
+        export default function () {
+          const responses = http.batch([
+            ['GET', 'http://localhost:5000/'],
+            ['GET', 'http://localhost:5000/health'],
+            ['POST', 'http://localhost:5000/calculate', 
+             JSON.stringify({ a: Math.random() * 100, b: Math.random() * 100, operation: 'add' }),
+             { headers: { 'Content-Type': 'application/json' } }],
+          ]);
+          
+          responses.forEach(response => {
+            check(response, {
+              'status is 200': (r) => r.status === 200,
+              'response time < 500ms': (r) => r.timings.duration < 500,
+            });
+            errorRate.add(response.status !== 200);
+          });
+          
+          sleep(1);
+        }
+        EOF
+        
+        k6 run --out json=test-results.json load-test.js
+
+    - name: 分析测试结果
+      run: |
+        python3 << 'EOF'
+        import json
+        import sys
+        
+        with open('test-results.json', 'r') as f:
+            results = [json.loads(line) for line in f if line.strip()]
+        
+        # 提取关键指标
+        http_req_durations = [r['data']['value'] for r in results 
+                             if r['type'] == 'Point' and r['metric'] == 'http_req_duration']
+        
+        if http_req_durations:
+            avg_duration = sum(http_req_durations) / len(http_req_durations)
+            p95_duration = sorted(http_req_durations)[int(len(http_req_durations) * 0.95)]
+            
+            print(f"Average response time: {avg_duration:.2f}ms")
+            print(f"P95 response time: {p95_duration:.2f}ms")
+            
+            # 检查是否满足性能要求
+            if p95_duration > 500:
+                print(f"Performance regression detected! P95: {p95_duration:.2f}ms > 500ms")
+                sys.exit(1)
+            else:
+                print(f"Performance test passed!")
+        EOF
+
+    - name: 上传测试结果
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-test-results
+        path: test-results.json

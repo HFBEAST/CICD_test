@@ -1,0 +1,116 @@
+name: Rollback Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for rollback'
+        required: true
+        type: string
+      target_version:
+        description: 'Version to rollback to (leave empty for previous version)'
+        required: false
+        type: string
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 配置AWS凭证
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: 确定回滚版本
+      id: get-version
+      run: |
+        if [ -n "${{ github.event.inputs.target_version }}" ]; then
+          TARGET_VERSION="${{ github.event.inputs.target_version }}"
+        else
+          # 获取前一个版本
+          TARGET_VERSION=$(aws s3 ls s3://my-deployments/production/ \
+            | grep -E '[0-9]{8}-[0-9]{6}\.json' \
+            | sort -r \
+            | head -2 \
+            | tail -1 \
+            | awk '{print $4}' \
+            | xargs -I {} aws s3 cp s3://my-deployments/production/{} - \
+            | jq -r '.version')
+        fi
+        
+        echo "Rolling back to version: $TARGET_VERSION"
+        echo "version=$TARGET_VERSION" >> $GITHUB_OUTPUT
+
+    - name: 执行回滚
+      run: |
+        # 切换ALB流量到绿环境（假设绿环境运行着前一个版本）
+        aws elbv2 modify-rule \
+          --rule-arn ${{ secrets.PROD_ALB_RULE_ARN }} \
+          --actions Type=forward,TargetGroupArn=${{ secrets.GREEN_TARGET_GROUP_ARN }}
+        
+        echo "Traffic switched to green environment (previous version)"
+
+    - name: 验证回滚
+      run: |
+        sleep 30
+        PROD_URL="https://api.example.com"
+        response=$(curl -s -o /dev/null -w "%{http_code}" $PROD_URL/health)
+        
+        if [ $response -eq 200 ]; then
+          echo "Rollback successful - API is healthy"
+        else
+          echo "Rollback may have issues - API returned $response"
+          exit 1
+        fi
+
+    - name: 记录回滚
+      run: |
+        cat << EOF > rollback-record.json
+        {
+          "action": "rollback",
+          "target_version": "${{ steps.get-version.outputs.version }}",
+          "reason": "${{ github.event.inputs.reason }}",
+          "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+          "initiated_by": "${{ github.actor }}"
+        }
+        EOF
+        
+        aws s3 cp rollback-record.json \
+          s3://my-deployments/rollbacks/$(date +%Y%m%d-%H%M%S).json
+
+    - name: 发送回滚通知
+      uses: 8398a7/action-slack@v3
+      with:
+        status: custom
+        custom_payload: |
+          {
+            "text": "⚠️ Production Rollback Executed",
+            "attachments": [{
+              "color": "warning",
+              "fields": [
+                {
+                  "title": "Rolled back to",
+                  "value": "${{ steps.get-version.outputs.version }}",
+                  "short": true
+                },
+                {
+                  "title": "Reason",
+                  "value": "${{ github.event.inputs.reason }}",
+                  "short": false
+                },
+                {
+                  "title": "Initiated by",
+                  "value": "${{ github.actor }}",
+                  "short": true
+                }
+              ]
+            }]
+          }
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}

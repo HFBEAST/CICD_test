@@ -1,0 +1,224 @@
+name: CI Pipeline
+
+# 触发条件
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  # Job 1: 代码质量检查
+  lint:RetryYYContinueEditGitHub Actions CI/CD 工作流配置Document ∙ Version 2 jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 配置AWS凭证
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key现在让我创建一个实战指南，帮助你一步步实施这个CI/CD项目：GitHub Actions CI/CD 实战实施指南Document # GitHub Actions CI/CD 实战实施指南
+
+## 第一阶段：项目初始化（第1-2天）
+
+### 1.1 创建GitHub仓库
+
+```bash
+# 本地初始化项目
+mkdir my-python-api
+cd my-python-api
+git init
+
+# 创建基础文件结构
+mkdir -p src tests .github/workflows
+touch src/__init__.py src/app.py
+touch tests/__init__.py tests/tRetryClaude can make mistakes. Please double-check responses.Research Opus 4.1v2∙LatestCopyPublishGitHub Actions CI/CD 工作流配置
+1. CI工作流 (.github/workflows/ci.yml)
+yamlname: CI Pipeline
+
+# 触发条件
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  # Job 1: 代码质量检查
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 设置Python环境
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: 缓存pip依赖
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements-dev.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: 安装依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-dev.txt
+    
+    - name: 运行flake8代码检查
+      run: |
+        flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: 运行black格式检查
+      run: |
+        black --check src/ tests/
+    
+    - name: 运行mypy类型检查
+      run: |
+        mypy src/ --ignore-missing-imports
+
+  # Job 2: 单元测试
+  test:
+    runs-on: ubuntu-latest
+    needs: lint  # 依赖lint job完成
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 设置Python环境
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: 安装依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-dev.txt
+    
+    - name: 运行pytest测试
+      run: |
+        pytest tests/ -v --cov=src --cov-report=xml --cov-report=term
+    
+    - name: 上传测试覆盖率到Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  # Job 3: 安全扫描
+  security:
+    runs-on: ubuntu-latest
+    needs: lint
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 运行安全扫描 - Bandit
+      run: |
+        pip install bandit
+        bandit -r src/ -f json -o bandit-report.json || true
+    
+    - name: 运行依赖安全检查 - Safety
+      run: |
+        pip install safety
+        safety check --json > safety-report.json || true
+    
+    - name: 上传安全报告
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+
+  # Job 4: 构建Docker镜像
+  build:
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 设置Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: 登录Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: 提取元数据
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.DOCKER_USERNAME }}/my-python-api
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+    
+    - name: 构建并推送Docker镜像
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/my-python-api:buildcache
+        cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/my-python-api:buildcache,mode=max
+
+  # Job 5: 集成测试
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: build
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 运行集成测试
+      run: |
+        docker run --rm \
+          --network host \
+          -e DATABASE_URL=postgresql://postgres:testpass@localhost:5432/testdb \
+          ${{ secrets.DOCKER_USERNAME }}/my-python-api:sha-${{ github.sha }} \
+          pytest tests/integration/ || echo "No integration tests yet"

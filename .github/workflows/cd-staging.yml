@@ -1,0 +1,77 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [ develop ]
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [develop]
+
+jobs:
+  deploy-staging:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+
+    - name: 配置AWS凭证
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: 登录Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-get-login@v2
+
+    - name: 构建、标记并推送镜像到ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: my-python-api
+        IMAGE_TAG: staging-${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:staging-latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:staging-latest
+
+    - name: 更新ECS服务
+      run: |
+        aws ecs update-service \
+          --cluster staging-cluster \
+          --service my-python-api-staging \
+          --force-new-deployment \
+          --desired-count 2
+
+    - name: 等待服务稳定
+      run: |
+        aws ecs wait services-stable \
+          --cluster staging-cluster \
+          --services my-python-api-staging
+
+    - name: 运行冒烟测试
+      run: |
+        sleep 30  # 等待服务完全启动
+        response=$(curl -s -o /dev/null -w "%{http_code}" https://staging-api.example.com/health)
+        if [ $response -eq 200 ]; then
+          echo "Health check passed"
+        else
+          echo "Health check failed with status $response"
+          exit 1
+        fi
+
+    - name: 发送Slack通知
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: |
+          Staging Deployment ${{ job.status }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      if: always()

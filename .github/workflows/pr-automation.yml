@@ -1,0 +1,193 @@
+name: PR Automation
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+
+jobs:
+  auto-label:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 自动添加标签
+      uses: actions/labeler@v4
+      with:
+        repo-token: "${{ secrets.GITHUB_TOKEN }}"
+        configuration-path: .github/labeler.yml
+
+    - name: 根据文件变化添加标签
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { data: files } = await github.rest.pulls.listFiles({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: context.issue.number
+          });
+          
+          const labels = new Set();
+          
+          for (const file of files) {
+            if (file.filename.startsWith('src/')) labels.add('backend');
+            if (file.filename.startsWith('tests/')) labels.add('tests');
+            if (file.filename.startsWith('.github/')) labels.add('ci/cd');
+            if (file.filename.includes('requirements')) labels.add('dependencies');
+            if (file.filename === 'Dockerfile') labels.add('docker');
+          }
+          
+          if (labels.size > 0) {
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: Array.from(labels)
+            });
+          }
+
+  pr-size-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 检查PR大小
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { data: pr } = await github.rest.pulls.get({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: context.issue.number
+          });
+          
+          const additions = pr.additions;
+          const deletions = pr.deletions;
+          const total = additions + deletions;
+          
+          let size = 'small';
+          if (total > 1000) size = 'large';
+          else if (total > 500) size = 'medium';
+          
+          // 添加大小标签
+          await github.rest.issues.addLabels({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            labels: [`size/${size}`]
+          });
+          
+          // 如果PR太大，添加警告评论
+          if (total > 1000) {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `⚠️ This PR contains ${total} lines of changes. Consider breaking it into smaller PRs for easier review.`
+            });
+          }
+
+  auto-merge:
+    if: github.event_name == 'pull_request_review' && github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 自动合并依赖更新
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const pr = context.payload.pull_request;
+          
+          // 只自动合并依赖更新的PR
+          if (pr.user.login === 'dependabot[bot]' || 
+              pr.title.includes('[Automated] Dependency Updates')) {
+            
+            // 检查所有检查是否通过
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: pr.head.sha
+            });
+            
+            const allChecksPassed = checks.check_runs.every(
+              check => check.status === 'completed' && check.conclusion === 'success'
+            );
+            
+            if (allChecksPassed) {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                merge_method: 'squash'
+              });
+              
+              console.log(`Automatically merged PR #${pr.number}`);
+            }
+          }
+
+  command-handler:
+    if: github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/')
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 处理斜杠命令
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const command = context.payload.comment.body.trim();
+          const issueNumber = context.issue.number;
+          
+          // /rerun - 重新运行失败的检查
+          if (command === '/rerun') {
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: issueNumber
+            });
+            
+            // 触发工作流重新运行
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ci.yml',
+              ref: pr.head.ref
+            });
+            
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            });
+          }
+          
+          // /approve - 批准PR（仅限维护者）
+          if (command === '/approve') {
+            const { data: user } = await github.rest.users.getAuthenticated();
+            
+            // 检查用户权限
+            const { data: perms } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: user.login
+            });
+            
+            if (perms.permission === 'admin' || perms.permission === 'write') {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: issueNumber,
+                event: 'APPROVE'
+              });
+              
+              await github.rest.reactions.createForIssueComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: context.payload.comment.id,
+                content: '+1'
+              });
+            }
+          }
